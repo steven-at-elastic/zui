@@ -284,6 +284,9 @@ pub struct Style {
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
 
+    /// Opt-in superellipse corners: 0 is circular, 1 is squircle, up to 2 is stronger.
+    pub corner_smoothing: f32,
+
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
@@ -704,7 +707,12 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
-        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_drop_shadows_with_corner_smoothing(
+            bounds,
+            corner_radii,
+            &self.box_shadow,
+            self.corner_smoothing,
+        );
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
@@ -723,17 +731,25 @@ impl Style {
                 None => Hsla::default(),
             };
             border_color.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background_color.unwrap_or_default(),
-                Edges::default(),
-                border_color,
-                self.border_style,
-            ));
+            window.paint_quad_with_corner_smoothing(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background_color.unwrap_or_default(),
+                    Edges::default(),
+                    border_color,
+                    self.border_style,
+                ),
+                self.corner_smoothing,
+            );
         }
 
-        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_inset_shadows_with_corner_smoothing(
+            bounds,
+            corner_radii,
+            &self.box_shadow,
+            self.corner_smoothing,
+        );
 
         continuation(window, cx);
 
@@ -741,14 +757,17 @@ impl Style {
             let border_widths = self.border_widths.to_pixels(rem_size);
             let mut background = self.border_color.unwrap_or_default();
             background.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background,
-                border_widths,
-                self.border_color.unwrap_or_default(),
-                self.border_style,
-            ));
+            window.paint_quad_with_corner_smoothing(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background,
+                    border_widths,
+                    self.border_color.unwrap_or_default(),
+                    self.border_style,
+                ),
+                self.corner_smoothing,
+            );
         }
 
         #[cfg(debug_assertions)]
@@ -801,6 +820,7 @@ impl Default for Style {
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
+            corner_smoothing: 0.0,
             box_shadow: Default::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,

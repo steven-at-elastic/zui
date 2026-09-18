@@ -31,7 +31,7 @@ float quad_sdf_impl(float2 center_to_point, float corner_radius);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size);
+                   float2 half_size, float smoothing);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
 float edge_fade_alpha(float2 position, EdgeFadeParams fade);
@@ -96,6 +96,34 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       gradient.color0,
       gradient.color1,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+
+// Continuous superellipse corners: exponent 2 preserves circles, 4 is a
+// squircle. Normalize the implicit distance by its gradient for stable AA.
+float smooth_ellipse_sdf(float2 q, float2 radii, float smoothing) {
+    float exponent = 2.0 + 2.0 * smoothing;
+    radii = max(radii, float2(0.0001, 0.0001));
+    float2 v = max(q, float2(0.0, 0.0)) / radii;
+    float n = pow(pow(v.x, exponent) + pow(v.y, exponent), 1.0 / exponent);
+    float2 gradient = pow(v / max(n, 0.0001), float2(exponent - 1.0, exponent - 1.0)) / radii;
+    return (n - 1.0) / max(length(gradient), 0.0001);
+}
+float smooth_corner_sdf(float2 q, float radius, float smoothing) {
+    if (smoothing <= 0.0 || radius <= 0.0 || min(q.x, q.y) <= 0.0) {
+        return quad_sdf_impl(q, radius);
+    }
+    float exponent = 2.0 + 2.0 * smoothing;
+    float2 v = q / radius;
+    float n = pow(pow(v.x, exponent) + pow(v.y, exponent), 1.0 / exponent);
+    float2 gradient = pow(v / max(n, 0.0001), float2(exponent - 1.0, exponent - 1.0));
+    return (n - 1.0) * radius / max(length(gradient), 0.0001);
+}
+float smooth_quad_sdf(float2 pt, Bounds_ScaledPixels bounds, Corners_ScaledPixels radii, float smoothing) {
+    float2 half_size = float2(bounds.size.width, bounds.size.height) / 2.0;
+    float2 delta = pt - float2(bounds.origin.x, bounds.origin.y) - half_size;
+    float radius = pick_corner_radius(delta, radii);
+    return smooth_corner_sdf(fabs(delta) - half_size + radius, radius, smoothing);
 }
 
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
@@ -185,7 +213,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   }
 
   // Signed distance of the point to the outside edge of the quad's border
-  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+  float outer_sdf = smooth_corner_sdf(corner_center_to_point, corner_radius, quad.corner_smoothing);
 
   // Approximate signed distance of the point to the inside edge of the quad's
   // border. It is negative outside this edge (within the border), and
@@ -208,7 +236,9 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     inner_sdf = -(outer_sdf + reduced_border.x);
   } else {
     float2 ellipse_radii = max(float2(0.0), float2(corner_radius) - reduced_border);
-    inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+    inner_sdf = quad.corner_smoothing > 0.0
+        ? -smooth_ellipse_sdf(corner_center_to_point, ellipse_radii, quad.corner_smoothing)
+        : quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
   }
 
   // Negative when inside the border
@@ -528,7 +558,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
   float alpha;
   if (shadow.blur_radius == 0.) {
-    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+    float distance = smooth_quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii, shadow.corner_smoothing);
     alpha = saturate(0.5 - distance);
   } else {
     // The signal is only non-zero in a limited range, so don't waste samples
@@ -543,7 +573,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha = 0.;
     for (int i = 0; i < 4; i++) {
       alpha += blur_along_x(point.x, point.y - y, shadow.blur_radius,
-                            corner_radius, half_size) *
+                            corner_radius, half_size, shadow.corner_smoothing) *
                gaussian(y, shadow.blur_radius) * step;
       y += step;
     }
@@ -553,8 +583,8 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
     // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
     alpha = 1. - alpha;
-    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                      shadow.element_corner_radii);
+    float element_distance = smooth_quad_sdf(input.position.xy, shadow.element_bounds,
+                                      shadow.element_corner_radii, shadow.corner_smoothing);
     alpha *= saturate(0.5 - element_distance);
   }
 
@@ -1125,10 +1155,14 @@ float2 erf(float2 x) {
 }
 
 float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size) {
+                   float2 half_size, float smoothing) {
   float delta = min(half_size.y - corner - abs(y), 0.);
-  float curved =
-      half_size.x - corner + sqrt(max(0., corner * corner - delta * delta));
+  float curve = sqrt(max(0., corner * corner - delta * delta));
+  if (smoothing > 0.0 && corner > 0.0) {
+    float exponent = 2.0 + 2.0 * smoothing;
+    curve = corner * pow(max(0.0, 1.0 - pow(abs(delta) / corner, exponent)), 1.0 / exponent);
+  }
+  float curved = half_size.x - corner + curve;
   float2 integral =
       0.5 + 0.5 * erf((x + float2(-curved, curved)) * (sqrt(0.5) / sigma));
   return integral.y - integral.x;
@@ -1361,7 +1395,7 @@ fragment float4 backdrop_blur_fragment(
 
   // Rounded-rect clip: blending is disabled on this pipeline (the blur
   // REPLACES the region), so fragments outside must discard, not return 0.
-  float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+  float distance = smooth_quad_sdf(input.position.xy, blur.bounds, blur.corner_radii, blur.corner_smoothing);
   if (distance > 0.) {
     discard_fragment();
   }

@@ -3980,6 +3980,17 @@ impl Window {
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
     ) {
+        self.paint_drop_shadows_with_corner_smoothing(bounds, corner_radii, shadows, 0.0);
+    }
+
+    /// Paint with opt-in continuous superellipse corners (0 = circular, 1 = squircle).
+    pub fn paint_drop_shadows_with_corner_smoothing(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+        corner_smoothing: f32,
+    ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -4002,7 +4013,11 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 0,
-                pad: 0,
+                corner_smoothing: if corner_smoothing.is_finite() {
+                    corner_smoothing.clamp(0.0, 2.0)
+                } else {
+                    0.0
+                },
             });
         }
     }
@@ -4015,6 +4030,17 @@ impl Window {
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
+    ) {
+        self.paint_inset_shadows_with_corner_smoothing(bounds, corner_radii, shadows, 0.0);
+    }
+
+    /// Paint with opt-in continuous superellipse corners (0 = circular, 1 = squircle).
+    pub fn paint_inset_shadows_with_corner_smoothing(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+        corner_smoothing: f32,
     ) {
         self.invalidator.debug_assert_paint();
 
@@ -4047,7 +4073,11 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 1,
-                pad: 0,
+                corner_smoothing: if corner_smoothing.is_finite() {
+                    corner_smoothing.clamp(0.0, 2.0)
+                } else {
+                    0.0
+                },
             });
         }
     }
@@ -4066,6 +4096,17 @@ impl Window {
         corner_radii: Corners<Pixels>,
         blur_radius: Pixels,
     ) {
+        self.paint_backdrop_blur_with_corner_smoothing(bounds, corner_radii, blur_radius, 0.0);
+    }
+
+    /// Paint with opt-in continuous superellipse corners (0 = circular, 1 = squircle).
+    pub fn paint_backdrop_blur_with_corner_smoothing(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+        corner_smoothing: f32,
+    ) {
         self.invalidator.debug_assert_paint();
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask().scale(scale_factor);
@@ -4081,9 +4122,19 @@ impl Window {
             element_bounds: bounds.scale(scale_factor),
             element_corner_radii: corner_radii.scale(scale_factor),
             inset: 0,
-            pad: 0,
+            corner_smoothing: if corner_smoothing.is_finite() {
+                corner_smoothing.clamp(0.0, 2.0)
+            } else {
+                0.0
+            },
         });
         self.next_frame.scene.insert_backdrop_blur(BackdropBlur {
+            corner_smoothing: if corner_smoothing.is_finite() {
+                corner_smoothing.clamp(0.0, 2.0)
+            } else {
+                0.0
+            },
+            smoothing_pad: 0,
             order: 0,
             blur_radius: blur_radius.scale(scale_factor),
             bounds: bounds.scale(scale_factor),
@@ -4102,6 +4153,12 @@ impl Window {
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
     pub fn paint_quad(&mut self, quad: PaintQuad) {
+        self.paint_quad_with_corner_smoothing(quad, 0.0);
+    }
+
+    /// Paint a quad with continuous superellipse corners. Zero preserves the
+    /// original circular path; one uses a fourth-power squircle.
+    pub fn paint_quad_with_corner_smoothing(&mut self, quad: PaintQuad, corner_smoothing: f32) {
         self.invalidator.debug_assert_paint();
 
         // Scoped edge fades apply PER PIXEL in the fragment shader
@@ -4114,6 +4171,12 @@ impl Window {
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
         let quad = Quad {
+            corner_smoothing: if corner_smoothing.is_finite() {
+                corner_smoothing.clamp(0.0, 2.0)
+            } else {
+                0.0
+            },
+            smoothing_pad: 0,
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),

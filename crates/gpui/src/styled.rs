@@ -33,6 +33,18 @@ pub trait Styled: Sized {
     gpui_macros::border_style_methods!();
     gpui_macros::box_shadow_style_methods!();
 
+    /// Smooth rounded corners continuously into a squircle. Zero preserves
+    /// circular rendering; values above one strengthen the squircle, up to two.
+    /// This does not change descendant clipping or images.
+    fn corner_smoothing(mut self, smoothing: f32) -> Self {
+        self.style().corner_smoothing = Some(if smoothing.is_finite() {
+            smoothing.clamp(0.0, 2.0)
+        } else {
+            0.0
+        });
+        self
+    }
+
     /// Sets the display type of the element to `block`.
     /// [Docs](https://tailwindcss.com/docs/display)
     fn block(mut self) -> Self {

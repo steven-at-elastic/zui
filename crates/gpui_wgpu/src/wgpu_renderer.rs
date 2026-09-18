@@ -136,6 +136,7 @@ struct BackdropBlurUniform {
     corner_radii: [f32; 4],
     clip_bounds: PodBounds,
     source_rect: [f32; 4],
+    smoothing: [f32; 4],
 }
 
 /// One backdrop-blur region's GPU scratch: the full-res snapshot copied out
@@ -1387,6 +1388,7 @@ impl WgpuRenderer {
             &resources.backdrop_blur_params_buffer,
             c_offset,
             bytemuck::bytes_of(&BackdropBlurUniform {
+                smoothing: [blur.corner_smoothing, 0.0, 0.0, 0.0],
                 bounds: blur.bounds.into(),
                 corner_radii: [
                     blur.corner_radii.top_left.0,

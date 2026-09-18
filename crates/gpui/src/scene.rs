@@ -620,6 +620,8 @@ pub struct Quad {
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
     pub fade: EdgeFadeParams,
+    pub corner_smoothing: f32,
+    pub smoothing_pad: u32,
 }
 
 impl From<Quad> for Primitive {
@@ -661,6 +663,8 @@ pub struct BackdropBlur {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    pub corner_smoothing: f32,
+    pub smoothing_pad: u32,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -677,7 +681,7 @@ pub struct Shadow {
     pub element_corner_radii: Corners<ScaledPixels>,
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
-    pub pad: u32, // align to 8 bytes
+    pub corner_smoothing: f32,
 }
 
 impl From<Shadow> for Primitive {
@@ -1144,7 +1148,7 @@ mod tests {
             element_bounds: bounds(),
             element_corner_radii: Corners::default(),
             inset: 0,
-            pad: 0,
+            corner_smoothing: 0.0,
         }
     }
 
@@ -1152,6 +1156,8 @@ mod tests {
     fn paint_blur(scene: &mut Scene) {
         scene.insert_primitive(shadow(crate::transparent_black()));
         scene.insert_backdrop_blur(BackdropBlur {
+            corner_smoothing: 0.0,
+            smoothing_pad: 0,
             order: 0,
             blur_radius: ScaledPixels(10.),
             bounds: bounds(),
@@ -1220,6 +1226,8 @@ mod tests {
         // shadow splitter. Quads on either side must remain separate batches.
         scene.insert_primitive(quad);
         scene.insert_backdrop_blur(BackdropBlur {
+            corner_smoothing: 0.0,
+            smoothing_pad: 0,
             order: 0,
             blur_radius: ScaledPixels(10.),
             bounds: bounds(),

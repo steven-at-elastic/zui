@@ -100,6 +100,8 @@ fn quad(order: u32, rect: Bounds<ScaledPixels>, color: Hsla) -> Quad {
 
 fn blur(order: u32) -> BackdropBlur {
     BackdropBlur {
+        corner_smoothing: 0.0,
+        smoothing_pad: 0,
         order,
         blur_radius: ScaledPixels(3.),
         bounds: bounds(8., 8., 48., 48.),

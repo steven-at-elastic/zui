@@ -15,6 +15,7 @@ struct Params {
     corners: [f32; 4],
     clip: [f32; 4],
     source: [f32; 4],
+    smoothing: [f32; 4],
     // xy = native-source UV step, z = sigma, w = 1 only for texel-aligned paired taps.
     kernel: [f32; 4],
     weights: [[f32; 4]; KERNEL_VECTORS],
@@ -324,6 +325,7 @@ impl DirectXRenderer {
         // Filter native pixels before reducing either axis to avoid aliasing fine detail.
         let sigma_texels = sigma;
         let mut params = Params {
+            smoothing: [blur.corner_smoothing, 0.0, 0.0, 0.0],
             bounds: rect(blur.bounds),
             corners: [
                 blur.corner_radii.top_left.0,

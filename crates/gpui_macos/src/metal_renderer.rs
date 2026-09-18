@@ -2414,6 +2414,8 @@ mod backdrop_blur_tests {
 
     fn push_quad(scene: &mut Scene, b: Bounds<ScaledPixels>, lightness: f32) {
         scene.insert_primitive(Quad {
+            corner_smoothing: 0.0,
+            smoothing_pad: 0,
             order: 0,
             border_style: Default::default(),
             bounds: b,
@@ -2464,9 +2466,11 @@ mod backdrop_blur_tests {
             element_bounds: blur_bounds,
             element_corner_radii: Corners::default(),
             inset: 0,
-            pad: 0,
+            corner_smoothing: 0.0,
         });
         scene.insert_backdrop_blur(BackdropBlur {
+            corner_smoothing: 0.0,
+            smoothing_pad: 0,
             order: 0,
             blur_radius: ScaledPixels(radius),
             bounds: blur_bounds,
@@ -2497,6 +2501,49 @@ mod backdrop_blur_tests {
             }
         }
         max
+    }
+
+    #[test]
+    fn continuous_corners_change_only_the_corner_and_keep_blur_mask_aligned() {
+        let surface = bounds(100., 100., 200., 120.);
+        let draw = |smoothing: f32, blur: bool| {
+            let mut scene = Scene::default();
+            push_quad(&mut scene, viewport(), 0.0);
+            if blur {
+                // High-frequency stripes make blur coverage observable.
+                for x in (0..VIEW_W).step_by(2) {
+                    push_quad(&mut scene, bounds(x as f32, 0., 1., VIEW_H as f32), 1.0);
+                }
+                push_blur(&mut scene, surface, 8.0);
+                let region = scene.backdrop_blurs.last_mut().unwrap();
+                region.corner_radii = Corners::all(ScaledPixels(40.));
+                region.corner_smoothing = smoothing;
+            } else {
+                scene.insert_primitive(Quad {
+                    bounds: surface,
+                    content_mask: ContentMask { bounds: viewport() },
+                    background: solid_background(gpui::white()),
+                    corner_radii: Corners::all(ScaledPixels(40.)),
+                    corner_smoothing: smoothing,
+                    ..Default::default()
+                });
+            }
+            render(&mut scene)
+        };
+        let circle = draw(0.0, false);
+        let smooth = draw(1.0, false);
+        assert!(circle.get_pixel(110, 110)[0] < 10);
+        assert!(smooth.get_pixel(110, 110)[0] > 245);
+        assert_eq!(circle.get_pixel(200, 160), smooth.get_pixel(200, 160));
+        assert!(smooth.get_pixel(100, 100)[0] < 10);
+        let circular_blur = draw(0.0, true);
+        let smoothed_blur = draw(1.0, true);
+        assert!(circular_blur.get_pixel(110, 110)[0] > 245);
+        assert!((60..200).contains(&smoothed_blur.get_pixel(110, 110)[0]));
+        assert_eq!(
+            circular_blur.get_pixel(100, 100),
+            smoothed_blur.get_pixel(100, 100)
+        );
     }
 
     #[test]

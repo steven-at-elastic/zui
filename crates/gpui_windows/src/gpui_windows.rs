@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn quad_hlsl_layout_includes_trailing_edge_fade() {
         assert_eq!(offset_of!(Quad, fade), 160);
-        assert_eq!(size_of::<Quad>(), 192);
+        assert_eq!(size_of::<Quad>(), 200);
         assert_fields_in_order(
             hlsl_struct("Quad"),
             &[

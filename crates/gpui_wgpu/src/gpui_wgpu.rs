@@ -24,6 +24,25 @@ mod shader_tests {
         .unwrap();
         for (name, size, offsets) in [
             (
+                "Quad",
+                size_of::<gpui::Quad>(),
+                vec![
+                    ("corner_smoothing", offset_of!(gpui::Quad, corner_smoothing)),
+                    ("fade", offset_of!(gpui::Quad, fade)),
+                ],
+            ),
+            (
+                "Shadow",
+                size_of::<gpui::Shadow>(),
+                vec![
+                    (
+                        "corner_smoothing",
+                        offset_of!(gpui::Shadow, corner_smoothing),
+                    ),
+                    ("element_bounds", offset_of!(gpui::Shadow, element_bounds)),
+                ],
+            ),
+            (
                 "ImageAlphaMaskParams",
                 size_of::<gpui::ImageAlphaMaskParams>(),
                 vec![

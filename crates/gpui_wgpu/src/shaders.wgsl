@@ -330,9 +330,14 @@ fn erf(v: vec2<f32>) -> vec2<f32> {
     return s - s / (r2 * r2);
 }
 
-fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>) -> f32 {
+fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>, smoothing: f32) -> f32 {
   let delta = min(half_size.y - corner - abs(y), 0.0);
-  let curved = half_size.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
+  var curve = sqrt(max(0.0, corner * corner - delta * delta));
+    if (smoothing > 0.0 && corner > 0.0) {
+        let exponent = 2.0 + 2.0 * smoothing;
+        curve = corner * pow(max(0.0, 1.0 - pow(abs(delta) / corner, exponent)), 1.0 / exponent);
+    }
+    let curved = half_size.x - corner + curve;
   let integral = 0.5 + 0.5 * erf((x + vec2<f32>(-curved, curved)) * (sqrt(0.5) / sigma));
   return integral.y - integral.x;
 }
@@ -557,6 +562,8 @@ struct Quad {
     corner_radii: Corners,
     border_widths: Edges,
     fade: EdgeFadeParams,
+    corner_smoothing: f32,
+    smoothing_pad: u32,
 }
 @group(1) @binding(0) var<storage, read> b_quads: array<Quad>;
 
@@ -711,7 +718,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     // Signed distance of the point to the outside edge of the quad's border. It
     // is positive outside this edge, and negative inside.
-    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    let outer_sdf = smooth_corner_sdf(corner_center_to_point, corner_radius, quad.corner_smoothing);
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
@@ -734,7 +741,11 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         inner_sdf = -(outer_sdf + reduced_border.x);
     } else {
         let ellipse_radii = max(vec2<f32>(0.0), corner_radius - reduced_border);
-        inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+        if (quad.corner_smoothing > 0.0) {
+            inner_sdf = -smooth_ellipse_sdf(corner_center_to_point, ellipse_radii, quad.corner_smoothing);
+        } else {
+            inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+        }
     }
 
     // Negative when inside the border
@@ -1017,7 +1028,7 @@ struct Shadow {
     element_corner_radii: Corners,
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
-    pad: u32, // align to 8 bytes
+    corner_smoothing: f32,
 }
 @group(1) @binding(0) var<storage, read> b_shadows: array<Shadow>;
 
@@ -1069,7 +1080,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
-        let distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        let distance = smooth_quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii, shadow.corner_smoothing);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
@@ -1084,7 +1095,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha = 0.0;
         for (var i = 0; i < 4; i += 1) {
             let blur = blur_along_x(center_to_point.x, center_to_point.y - y,
-                shadow.blur_radius, corner_radius, half_size);
+                shadow.blur_radius, corner_radius, half_size, shadow.corner_smoothing);
             alpha +=  blur * gaussian(y, shadow.blur_radius) * step;
             y += step;
         }
@@ -1094,8 +1105,8 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                        shadow.element_corner_radii);
+        let element_distance = smooth_quad_sdf(input.position.xy, shadow.element_bounds,
+                                        shadow.element_corner_radii, shadow.corner_smoothing);
         alpha *= saturate(0.5 - element_distance);
     }
 
@@ -1542,6 +1553,7 @@ struct BackdropBlurParams {
     corner_radii: Corners,
     clip_bounds: Bounds,
     source_rect: vec4<f32>,
+    smoothing: vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> b_backdrop_blur: BackdropBlurParams;
@@ -1575,7 +1587,7 @@ fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
         discard;
     }
     let params = b_backdrop_blur;
-    if (quad_sdf(input.device_position, params.bounds, params.corner_radii) > 0.0) {
+    if (smooth_quad_sdf(input.device_position, params.bounds, params.corner_radii, params.smoothing.x) > 0.0) {
         discard;
     }
 
@@ -1584,4 +1596,32 @@ fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
     // it regardless of that factor.
     let uv = (input.device_position - params.source_rect.xy) / params.source_rect.zw;
     return textureSampleLevel(t_backdrop_blurred, s_backdrop_blurred, uv, 0.0);
+}
+
+
+// Keep zero smoothing on the original circular fast path.
+fn smooth_corner_sdf(q: vec2<f32>, radius: f32, smoothing: f32) -> f32 {
+    if (smoothing <= 0.0 || radius <= 0.0 || min(q.x, q.y) <= 0.0) {
+        return quad_sdf_impl(q, radius);
+    }
+    let exponent = 2.0 + 2.0 * smoothing;
+    let v = q / radius;
+    let n = pow(pow(v.x, exponent) + pow(v.y, exponent), 1.0 / exponent);
+    let gradient = pow(v / max(n, 0.0001), vec2<f32>(exponent - 1.0));
+    return (n - 1.0) * radius / max(length(gradient), 0.0001);
+}
+fn smooth_quad_sdf(pt: vec2<f32>, bounds: Bounds, radii: Corners, smoothing: f32) -> f32 {
+    let half_size = bounds.size / 2.0;
+    let delta = pt - bounds.origin - half_size;
+    let radius = pick_corner_radius(delta, radii);
+    return smooth_corner_sdf(abs(delta) - half_size + radius, radius, smoothing);
+}
+
+fn smooth_ellipse_sdf(q: vec2<f32>, radius: vec2<f32>, smoothing: f32) -> f32 {
+    let exponent = 2.0 + 2.0 * smoothing;
+    let radii = max(radius, vec2<f32>(0.0001));
+    let v = max(q, vec2<f32>(0.0)) / radii;
+    let n = pow(pow(v.x, exponent) + pow(v.y, exponent), 1.0 / exponent);
+    let gradient = pow(v / max(n, 0.0001), vec2<f32>(exponent - 1.0)) / radii;
+    return (n - 1.0) / max(length(gradient), 0.0001);
 }

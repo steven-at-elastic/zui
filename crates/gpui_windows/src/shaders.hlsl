@@ -264,9 +264,14 @@ float2 erf(float2 x) {
     return s - s / (x * x);
 }
 
-float blur_along_x(float x, float y, float sigma, float corner, float2 half_size) {
+float blur_along_x(float x, float y, float sigma, float corner, float2 half_size, float smoothing) {
     float delta = min(half_size.y - corner - abs(y), 0.);
-    float curved = half_size.x - corner + sqrt(max(0., corner * corner - delta * delta));
+    float curve = sqrt(max(0., corner * corner - delta * delta));
+  if (smoothing > 0.0 && corner > 0.0) {
+    float exponent = 2.0 + 2.0 * smoothing;
+    curve = corner * pow(max(0.0, 1.0 - pow(abs(delta) / corner, exponent)), 1.0 / exponent);
+  }
+  float curved = half_size.x - corner + curve;
     float2 integral = 0.5 + 0.5 * erf((x + float2(-curved, curved)) * (sqrt(0.5) / sigma));
     return integral.y - integral.x;
 }
@@ -537,7 +542,37 @@ struct Quad {
     Corners corner_radii;
     Edges border_widths;
     EdgeFadeParams fade;
+    float corner_smoothing;
+    uint smoothing_pad;
 };
+
+
+// Continuous superellipse corners: exponent 2 preserves circles, 4 is a
+// squircle. Normalize the implicit distance by its gradient for stable AA.
+float smooth_ellipse_sdf(float2 q, float2 radii, float smoothing) {
+    float exponent = 2.0 + 2.0 * smoothing;
+    radii = max(radii, float2(0.0001, 0.0001));
+    float2 v = max(q, float2(0.0, 0.0)) / radii;
+    float n = pow(pow(v.x, exponent) + pow(v.y, exponent), 1.0 / exponent);
+    float2 gradient = pow(v / max(n, 0.0001), float2(exponent - 1.0, exponent - 1.0)) / radii;
+    return (n - 1.0) / max(length(gradient), 0.0001);
+}
+float smooth_corner_sdf(float2 q, float radius, float smoothing) {
+    if (smoothing <= 0.0 || radius <= 0.0 || min(q.x, q.y) <= 0.0) {
+        return quad_sdf_impl(q, radius);
+    }
+    float exponent = 2.0 + 2.0 * smoothing;
+    float2 v = q / radius;
+    float n = pow(pow(v.x, exponent) + pow(v.y, exponent), 1.0 / exponent);
+    float2 gradient = pow(v / max(n, 0.0001), float2(exponent - 1.0, exponent - 1.0));
+    return (n - 1.0) * radius / max(length(gradient), 0.0001);
+}
+float smooth_quad_sdf(float2 pt, Bounds bounds, Corners radii, float smoothing) {
+    float2 half_size = bounds.size / 2.0;
+    float2 delta = pt - bounds.origin - half_size;
+    float radius = pick_corner_radius(delta, radii);
+    return smooth_corner_sdf(abs(delta) - half_size + radius, radius, smoothing);
+}
 
 struct QuadVertexOutput {
     nointerpolation uint quad_id: TEXCOORD0;
@@ -667,7 +702,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     }
 
     // Signed distance of the point to the outside edge of the quad's border
-    float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    float outer_sdf = smooth_corner_sdf(corner_center_to_point, corner_radius, quad.corner_smoothing);
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
@@ -690,7 +725,9 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         inner_sdf = -(outer_sdf + reduced_border.x);
     } else {
         float2 ellipse_radii = max(float2(0.0, 0.0), float2(corner_radius, corner_radius) - reduced_border);
-        inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+        inner_sdf = quad.corner_smoothing > 0.0
+        ? -smooth_ellipse_sdf(corner_center_to_point, ellipse_radii, quad.corner_smoothing)
+        : quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
     }
 
     // Negative when inside the border
@@ -896,7 +933,7 @@ struct Shadow {
     Bounds element_bounds;
     Corners element_corner_radii;
     uint inset;
-    uint pad; // align to 8 bytes
+    float corner_smoothing; // align to 8 bytes
 };
 
 struct ShadowVertexOutput {
@@ -952,7 +989,7 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
 
     float alpha;
     if (shadow.blur_radius == 0.) {
-        float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        float distance = smooth_quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii, shadow.corner_smoothing);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
@@ -967,7 +1004,7 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         alpha = 0.;
         for (int i = 0; i < 4; i++) {
             alpha += blur_along_x(point0.x, point0.y - y, shadow.blur_radius,
-                                corner_radius, half_size) *
+                                corner_radius, half_size, shadow.corner_smoothing) *
                     gaussian(y, shadow.blur_radius) * step;
             y += step;
         }
@@ -977,8 +1014,8 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                          shadow.element_corner_radii);
+        float element_distance = smooth_quad_sdf(input.position.xy, shadow.element_bounds,
+                                          shadow.element_corner_radii, shadow.corner_smoothing);
         alpha *= saturate(0.5 - element_distance);
     }
 
@@ -1328,6 +1365,7 @@ cbuffer BackdropParams: register(b1) {
     Corners backdrop_corners;
     Bounds backdrop_clip;
     float4 backdrop_source;
+    float4 backdrop_smoothing;
     float4 backdrop_kernel;
     float4 backdrop_weights[33];
 };
@@ -1398,7 +1436,7 @@ float4 backdrop_composite_fragment(BackdropVertex input): SV_Target {
     // Blending is disabled. Discard outside the mask/rounded bounds instead
     // of returning transparent black, which would erase the existing frame.
     if (any(position < backdrop_clip.origin) || any(position >= backdrop_clip.origin + backdrop_clip.size)
-        || quad_sdf(position, backdrop_bounds, backdrop_corners) > 0.) {
+        || smooth_quad_sdf(position, backdrop_bounds, backdrop_corners, backdrop_smoothing.x) > 0.) {
         discard;
     }
     float2 uv = (position - backdrop_source.xy) / backdrop_source.zw;
