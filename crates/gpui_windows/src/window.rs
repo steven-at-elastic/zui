@@ -982,6 +982,23 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    // Input always reaches this HWND, and GPUI hit tests overlays first.
+    fn draw_layered(&self, scene: &Scene, overlay_start: usize, _capture_input: bool) {
+        self.state
+            .renderer
+            .borrow_mut()
+            .draw_layered(scene, overlay_start, self.state.background_appearance.get())
+            .log_err();
+    }
+
+    fn enable_scene_overlay(&self) -> Result<()> {
+        self.state.renderer.borrow_mut().enable_scene_overlay()
+    }
+
+    fn native_composition_slot(&self) -> Option<NativeCompositionSlot> {
+        self.state.renderer.borrow().native_composition_slot()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.state.renderer.borrow().sprite_atlas()
     }

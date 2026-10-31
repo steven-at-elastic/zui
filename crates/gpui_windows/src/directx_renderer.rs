@@ -16,7 +16,7 @@ use windows::{
             Dxgi::{Common::*, *},
         },
     },
-    core::{HSTRING, Interface},
+    core::{HSTRING, IUnknown, Interface},
 };
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
@@ -49,6 +49,9 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    overlay: Option<SceneOverlay>,
+    // Bumped each time the overlay tree is built; 0 until it is enabled.
+    overlay_generation: u64,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -127,6 +130,16 @@ struct DirectComposition {
     comp_visual: IDCompositionVisual,
 }
 
+// root -> [comp_visual (base swap chain), native, visual (overlay swap chain)]
+struct SceneOverlay {
+    swap_chain: IDXGISwapChain1,
+    render_target: Option<ID3D11Texture2D>,
+    render_target_view: Option<ID3D11RenderTargetView>,
+    native: IDCompositionVisual,
+    visual: IDCompositionVisual,
+    visible: bool,
+}
+
 impl DirectXRendererDevices {
     pub(crate) fn new(
         directx_devices: &DirectXDevices,
@@ -196,6 +209,8 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            overlay: None,
+            overlay_generation: 0,
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
@@ -272,6 +287,7 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.overlay.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -309,6 +325,13 @@ impl DirectXRenderer {
             composition.set_swap_chain(&resources.swap_chain)?;
             Some(composition)
         };
+        let overlay = match &direct_composition {
+            Some(composition) if self.overlay_generation != 0 => Some(
+                SceneOverlay::attach(&devices, composition, self.width, self.height)
+                    .context("Recreating scene overlay")?,
+            ),
+            _ => None,
+        };
 
         self.atlas
             .handle_device_lost(&devices.device, &devices.device_context);
@@ -323,7 +346,106 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        if overlay.is_some() {
+            self.overlay_generation += 1;
+        }
+        self.overlay = overlay;
         self.skip_draws = true;
+        Ok(())
+    }
+
+    pub(crate) fn enable_scene_overlay(&mut self) -> Result<()> {
+        if self.overlay.is_some() {
+            return Ok(());
+        }
+        let composition = self
+            .direct_composition
+            .as_ref()
+            .context("DirectComposition is disabled")?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.overlay = Some(SceneOverlay::attach(
+            devices,
+            composition,
+            self.width,
+            self.height,
+        )?);
+        self.overlay_generation += 1;
+        Ok(())
+    }
+
+    pub(crate) fn native_composition_slot(&self) -> Option<NativeCompositionSlot> {
+        let composition = self.direct_composition.as_ref()?;
+        let overlay = self.overlay.as_ref()?;
+        Some(NativeCompositionSlot {
+            device: composition.comp_device.as_raw(),
+            visual: overlay.native.as_raw(),
+            generation: self.overlay_generation,
+        })
+    }
+
+    // Presents both planes, then commits once so native visual changes made
+    // in this frame's present callbacks land with its pixels.
+    pub(crate) fn draw_layered(
+        &mut self,
+        scene: &Scene,
+        overlay_start: usize,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<()> {
+        if self.overlay.is_none() {
+            return self.draw(scene, background_appearance);
+        }
+        if self.skip_draws {
+            return Ok(());
+        }
+        let split = (overlay_start < scene.len()).then(|| scene.split_at(overlay_start));
+        let (base, overlay_scene) = match &split {
+            Some((base, overlay)) => (base, Some(overlay).filter(|overlay| !overlay.is_empty())),
+            None => (scene, None),
+        };
+        self.draw_scene(base, background_appearance)?;
+        if let Some(overlay_scene) = overlay_scene {
+            self.swap_overlay_target()?;
+            let result = self.draw_scene(overlay_scene, WindowBackgroundAppearance::Transparent);
+            self.swap_overlay_target()?;
+            result?;
+        }
+        let visible = overlay_scene.is_some();
+        self.present()?;
+        let overlay = self.overlay.as_mut().context("overlay missing")?;
+        unsafe {
+            if visible {
+                overlay
+                    .swap_chain
+                    .Present(0, DXGI_PRESENT(0))
+                    .ok()
+                    .context("Presenting overlay swap chain failed")?;
+            }
+            if visible != overlay.visible {
+                if visible {
+                    overlay.visual.SetContent(&overlay.swap_chain)?;
+                } else {
+                    overlay.visual.SetContent(None::<&IUnknown>)?;
+                }
+                overlay.visible = visible;
+            }
+            self.direct_composition
+                .as_ref()
+                .context("DirectComposition missing")?
+                .comp_device
+                .Commit()
+                .context("Committing DirectComposition")?;
+        }
+        Ok(())
+    }
+
+    fn swap_overlay_target(&mut self) -> Result<()> {
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let overlay = self.overlay.as_mut().context("overlay missing")?;
+        std::mem::swap(&mut resources.render_target, &mut overlay.render_target);
+        std::mem::swap(
+            &mut resources.render_target_view,
+            &mut overlay.render_target_view,
+        );
         Ok(())
     }
 
@@ -464,6 +586,27 @@ impl DirectXRenderer {
         }
 
         resources.recreate_resources(devices, width, height)?;
+
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.render_target.take();
+            overlay.render_target_view.take();
+            unsafe {
+                overlay
+                    .swap_chain
+                    .ResizeBuffers(
+                        BUFFER_COUNT as u32,
+                        width,
+                        height,
+                        RENDER_TARGET_FORMAT,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                    .context("Failed to resize overlay swap chain")?;
+            }
+            let (render_target, render_target_view) =
+                create_render_target_and_its_view(&overlay.swap_chain, &devices.device)?;
+            overlay.render_target = Some(render_target);
+            overlay.render_target_view = render_target_view;
+        }
 
         unsafe {
             devices
@@ -991,6 +1134,52 @@ impl DirectComposition {
             self.comp_device.Commit()?;
         }
         Ok(())
+    }
+}
+
+impl SceneOverlay {
+    fn attach(
+        devices: &DirectXRendererDevices,
+        composition: &DirectComposition,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let swap_chain = create_swap_chain_for_composition(
+            &devices.dxgi_factory,
+            &devices.device,
+            width,
+            height,
+        )
+        .context("Creating overlay swap chain")?;
+        let (render_target, render_target_view) =
+            create_render_target_and_its_view(&swap_chain, &devices.device)?;
+        let device = &composition.comp_device;
+        let base = &composition.comp_visual;
+        unsafe {
+            let root = device.CreateVisual()?;
+            let native = device.CreateVisual()?;
+            let visual = device.CreateVisual()?;
+            root.AddVisual(&native, true, None::<&IDCompositionVisual>)?;
+            root.AddVisual(&visual, true, &native)?;
+            // The base must leave the target before it can become a child.
+            composition.comp_target.SetRoot(&root)?;
+            if let Err(error) = root
+                .AddVisual(base, false, &native)
+                .and_then(|()| device.Commit())
+            {
+                root.RemoveAllVisuals().log_err();
+                composition.comp_target.SetRoot(base).log_err();
+                return Err(error.into());
+            }
+            Ok(Self {
+                swap_chain,
+                render_target: Some(render_target),
+                render_target_view,
+                native,
+                visual,
+                visible: false,
+            })
+        }
     }
 }
 

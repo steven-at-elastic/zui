@@ -176,6 +176,18 @@ impl Scene {
         }
     }
 
+    /// Replays the operations before and after `index` into two finished scenes.
+    pub fn split_at(&self, index: usize) -> (Scene, Scene) {
+        let index = index.min(self.len());
+        let mut base = Scene::default();
+        base.replay(0..index, self);
+        base.finish();
+        let mut overlay = Scene::default();
+        overlay.replay(index..self.len(), self);
+        overlay.finish();
+        (base, overlay)
+    }
+
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
@@ -1197,6 +1209,41 @@ mod tests {
             })
             .collect();
         assert_eq!(ranges, [0..1, 1..3, 3..5]);
+    }
+
+    #[test]
+    fn split_at_divides_operations_into_finished_scenes() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(shadow(crate::black()));
+        scene.push_layer(bounds());
+        paint_blur(&mut scene);
+        scene.pop_layer();
+        let index = scene.len();
+        scene.insert_primitive(shadow(crate::white()));
+        scene.insert_primitive(Quad {
+            bounds: bounds(),
+            content_mask: ContentMask { bounds: bounds() },
+            ..Quad::default()
+        });
+        scene.finish();
+
+        let (base, overlay) = scene.split_at(index);
+        assert_eq!(base.len() + overlay.len(), scene.len());
+        assert_eq!(base.shadows.len(), 2);
+        assert_eq!(base.backdrop_blurs.len(), 1);
+        assert!(base.quads.is_empty());
+        assert_eq!(overlay.shadows.len(), 1);
+        assert_eq!(overlay.shadows[0].color, crate::white());
+        assert_eq!(overlay.quads.len(), 1);
+        assert!(overlay.backdrop_blurs.is_empty());
+        assert!(!overlay.is_empty());
+
+        let (base, overlay) = scene.split_at(usize::MAX);
+        assert_eq!(base.len(), scene.len());
+        assert!(overlay.is_empty());
+        let (base, overlay) = scene.split_at(0);
+        assert!(base.is_empty());
+        assert_eq!(overlay.len(), scene.len());
     }
 
     #[test]

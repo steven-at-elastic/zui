@@ -1947,13 +1947,7 @@ impl PlatformWindow for MacWindow {
             state.renderer.draw(scene);
             return;
         }
-        let split = overlay_start.min(scene.len());
-        let mut base = gpui::Scene::default();
-        base.replay(0..split, scene);
-        base.finish();
-        let mut overlay = gpui::Scene::default();
-        overlay.replay(split..scene.len(), scene);
-        overlay.finish();
+        let (base, overlay) = scene.split_at(overlay_start);
         let visible = !overlay.is_empty();
         let active = capture_input && visible;
         let was_active = state.overlay_capture_input.swap(active, Ordering::AcqRel);

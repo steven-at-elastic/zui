@@ -790,6 +790,18 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
+/// Borrowed DirectComposition objects for native content between a window's
+/// base scene and its scene overlay. See [`crate::Window::native_composition_slot`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct NativeCompositionSlot {
+    /// The window's `IDCompositionDevice`.
+    pub device: *mut std::ffi::c_void,
+    /// An empty `IDCompositionVisual` above the base scene and below the overlay.
+    pub visual: *mut std::ffi::c_void,
+    /// Changes whenever `device` and `visual` are replaced.
+    pub generation: u64,
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -853,6 +865,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Enable a transparent scene plane above native children, once per window.
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {
         anyhow::bail!("Native scene overlays are unavailable on this platform")
+    }
+
+    /// The native visual slot beneath the scene overlay, once it is enabled.
+    fn native_composition_slot(&self) -> Option<NativeCompositionSlot> {
+        None
     }
 
     fn completed_frame(&self) {}

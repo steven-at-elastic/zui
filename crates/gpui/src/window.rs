@@ -8,10 +8,10 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeCompositionSlot, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -2900,6 +2900,19 @@ impl Window {
     /// Enable native-child compositing beneath deferred GPUI overlays.
     pub fn enable_scene_overlay(&self) -> anyhow::Result<()> {
         self.platform_window.enable_scene_overlay()
+    }
+
+    /// The DirectComposition slot between the base scene and the scene
+    /// overlay. Windows only, and `None` until [`Self::enable_scene_overlay`]
+    /// succeeds. The pointers are borrowed: clone them before keeping them.
+    ///
+    /// Create child visuals with `device` and add them to `visual`. Change them
+    /// inside [`Self::on_present`] callbacks and never call `Commit`; each
+    /// presented frame presents both swap chains and then commits the device
+    /// once, so the changes land with that frame's pixels. A new `generation`
+    /// means the device and slot were recreated: rebuild the children on it.
+    pub fn native_composition_slot(&self) -> Option<NativeCompositionSlot> {
+        self.platform_window.native_composition_slot()
     }
 
     /// Schedule a native-view update from an element's paint pass. Painting
