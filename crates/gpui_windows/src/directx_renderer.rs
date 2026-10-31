@@ -16,7 +16,7 @@ use windows::{
             Dxgi::{Common::*, *},
         },
     },
-    core::{HSTRING, IUnknown, Interface},
+    core::{BOOL, HSTRING, IUnknown, Interface},
 };
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
@@ -137,7 +137,10 @@ struct SceneOverlay {
     render_target_view: Option<ID3D11RenderTargetView>,
     native: IDCompositionVisual,
     visual: IDCompositionVisual,
+    frame_done: ID3D11Query,
     visible: bool,
+    // True while the overlay pass has swapped in its target; render_target is then the base.
+    drawing: bool,
 }
 
 impl DirectXRendererDevices {
@@ -276,7 +279,9 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        let disable_direct_composition = self.direct_composition.is_none();
+        // A window that enabled the overlay had DirectComposition; a failed attempt must not drop it.
+        let disable_direct_composition =
+            self.direct_composition.is_none() && self.overlay_generation == 0;
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -298,6 +303,16 @@ impl DirectXRenderer {
                     .log_err();
             }
 
+            if let Some(composition) = &self.direct_composition
+                && self.overlay_generation != 0
+            {
+                // The app may still hold this device through native visuals.
+                composition
+                    .comp_target
+                    .SetRoot(None::<&IDCompositionVisual>)
+                    .log_err();
+                composition.comp_device.Commit().log_err();
+            }
             self.direct_composition.take();
             self.devices.take();
         }
@@ -326,10 +341,11 @@ impl DirectXRenderer {
             Some(composition)
         };
         let overlay = match &direct_composition {
-            Some(composition) if self.overlay_generation != 0 => Some(
+            Some(composition) if self.overlay_generation != 0 => {
                 SceneOverlay::attach(&devices, composition, self.width, self.height)
-                    .context("Recreating scene overlay")?,
-            ),
+                    .context("Recreating scene overlay")
+                    .log_err()
+            }
             _ => None,
         };
 
@@ -383,8 +399,8 @@ impl DirectXRenderer {
         })
     }
 
-    // Presents both planes, then commits once so native visual changes made
-    // in this frame's present callbacks land with its pixels.
+    // Presents both planes, waits for the GPU, then commits once so native visual
+    // changes made in this frame's present callbacks normally land with its pixels.
     pub(crate) fn draw_layered(
         &mut self,
         scene: &Scene,
@@ -403,14 +419,10 @@ impl DirectXRenderer {
             None => (scene, None),
         };
         self.draw_scene(base, background_appearance)?;
-        if let Some(overlay_scene) = overlay_scene {
-            self.swap_overlay_target()?;
-            let result = self.draw_scene(overlay_scene, WindowBackgroundAppearance::Transparent);
-            self.swap_overlay_target()?;
-            result?;
-        }
-        let visible = overlay_scene.is_some();
+        let drawn = overlay_scene.map(|overlay_scene| self.draw_overlay(overlay_scene));
+        let visible = matches!(drawn, Some(Ok(())));
         self.present()?;
+        let devices = self.devices.as_ref().context("devices missing")?;
         let overlay = self.overlay.as_mut().context("overlay missing")?;
         unsafe {
             if visible {
@@ -419,6 +431,12 @@ impl DirectXRenderer {
                     .Present(0, DXGI_PRESENT(0))
                     .ok()
                     .context("Presenting overlay swap chain failed")?;
+            } else if overlay.visible {
+                // Leave nothing stale to show if DWM attaches before the next frame lands.
+                overlay
+                    .ensure_target(devices, self.width, self.height)
+                    .and_then(|()| overlay.present_transparent(&devices.device_context))
+                    .log_err();
             }
             if visible != overlay.visible {
                 if visible {
@@ -428,6 +446,7 @@ impl DirectXRenderer {
                 }
                 overlay.visible = visible;
             }
+            overlay.wait_for_gpu(&devices.device_context);
             self.direct_composition
                 .as_ref()
                 .context("DirectComposition missing")?
@@ -435,7 +454,19 @@ impl DirectXRenderer {
                 .Commit()
                 .context("Committing DirectComposition")?;
         }
-        Ok(())
+        drawn.unwrap_or(Ok(()))
+    }
+
+    fn draw_overlay(&mut self, scene: &Scene) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.overlay
+            .as_mut()
+            .context("overlay missing")?
+            .ensure_target(devices, self.width, self.height)?;
+        self.swap_overlay_target()?;
+        let result = self.draw_scene(scene, WindowBackgroundAppearance::Transparent);
+        self.swap_overlay_target()?;
+        result
     }
 
     fn swap_overlay_target(&mut self) -> Result<()> {
@@ -446,6 +477,7 @@ impl DirectXRenderer {
             &mut resources.render_target_view,
             &mut overlay.render_target_view,
         );
+        overlay.drawing = !overlay.drawing;
         Ok(())
     }
 
@@ -588,24 +620,8 @@ impl DirectXRenderer {
         resources.recreate_resources(devices, width, height)?;
 
         if let Some(overlay) = self.overlay.as_mut() {
-            overlay.render_target.take();
-            overlay.render_target_view.take();
-            unsafe {
-                overlay
-                    .swap_chain
-                    .ResizeBuffers(
-                        BUFFER_COUNT as u32,
-                        width,
-                        height,
-                        RENDER_TARGET_FORMAT,
-                        DXGI_SWAP_CHAIN_FLAG(0),
-                    )
-                    .context("Failed to resize overlay swap chain")?;
-            }
-            let (render_target, render_target_view) =
-                create_render_target_and_its_view(&overlay.swap_chain, &devices.device)?;
-            overlay.render_target = Some(render_target);
-            overlay.render_target_view = render_target_view;
+            // Retried by ensure_target on the next frame that needs it.
+            overlay.resize(devices, width, height).log_err();
         }
 
         unsafe {
@@ -1156,29 +1172,109 @@ impl SceneOverlay {
         let device = &composition.comp_device;
         let base = &composition.comp_visual;
         unsafe {
+            let mut frame_done = None;
+            devices.device.CreateQuery(
+                &D3D11_QUERY_DESC {
+                    Query: D3D11_QUERY_EVENT,
+                    MiscFlags: 0,
+                },
+                Some(&mut frame_done),
+            )?;
+            let overlay = Self {
+                swap_chain,
+                render_target: Some(render_target),
+                render_target_view,
+                native: device.CreateVisual()?,
+                visual: device.CreateVisual()?,
+                frame_done: frame_done.context("Creating overlay frame query")?,
+                visible: false,
+                drawing: false,
+            };
+            overlay.present_transparent(&devices.device_context)?;
             let root = device.CreateVisual()?;
-            let native = device.CreateVisual()?;
-            let visual = device.CreateVisual()?;
-            root.AddVisual(&native, true, None::<&IDCompositionVisual>)?;
-            root.AddVisual(&visual, true, &native)?;
+            root.AddVisual(&overlay.native, true, None::<&IDCompositionVisual>)?;
+            root.AddVisual(&overlay.visual, true, &overlay.native)?;
             // The base must leave the target before it can become a child.
             composition.comp_target.SetRoot(&root)?;
             if let Err(error) = root
-                .AddVisual(base, false, &native)
+                .AddVisual(base, false, &overlay.native)
                 .and_then(|()| device.Commit())
             {
                 root.RemoveAllVisuals().log_err();
                 composition.comp_target.SetRoot(base).log_err();
                 return Err(error.into());
             }
-            Ok(Self {
-                swap_chain,
-                render_target: Some(render_target),
-                render_target_view,
-                native,
-                visual,
-                visible: false,
-            })
+            Ok(overlay)
+        }
+    }
+
+    fn resize(&mut self, devices: &DirectXRendererDevices, width: u32, height: u32) -> Result<()> {
+        self.render_target.take();
+        self.render_target_view.take();
+        unsafe {
+            devices.device_context.OMSetRenderTargets(None, None);
+            self.swap_chain
+                .ResizeBuffers(
+                    BUFFER_COUNT as u32,
+                    width,
+                    height,
+                    RENDER_TARGET_FORMAT,
+                    DXGI_SWAP_CHAIN_FLAG(0),
+                )
+                .context("Failed to resize overlay swap chain")?;
+        }
+        let (render_target, render_target_view) =
+            create_render_target_and_its_view(&self.swap_chain, &devices.device)?;
+        self.render_target = Some(render_target);
+        self.render_target_view = render_target_view;
+        Ok(())
+    }
+
+    fn ensure_target(
+        &mut self,
+        devices: &DirectXRendererDevices,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        if self.render_target_view.is_none() {
+            self.resize(devices, width, height)?;
+        }
+        Ok(())
+    }
+
+    fn present_transparent(&self, context: &ID3D11DeviceContext) -> Result<()> {
+        let view = self
+            .render_target_view
+            .as_ref()
+            .context("missing overlay render target view")?;
+        unsafe {
+            context.ClearRenderTargetView(view, &[0.0; 4]);
+            self.swap_chain
+                .Present(0, DXGI_PRESENT(0))
+                .ok()
+                .context("Presenting overlay swap chain failed")
+        }
+    }
+
+    // Bounded so a stalled GPU delays the commit by at most about a frame.
+    fn wait_for_gpu(&self, context: &ID3D11DeviceContext) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(16);
+        unsafe {
+            context.End(&self.frame_done);
+            context.Flush();
+            loop {
+                let mut done = BOOL(0);
+                let polled = context.GetData(
+                    &self.frame_done,
+                    Some(&mut done as *mut BOOL as *mut std::ffi::c_void),
+                    std::mem::size_of::<BOOL>() as u32,
+                    D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+                );
+                if polled.is_err() || done.as_bool() || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(250));
+            }
         }
     }
 }

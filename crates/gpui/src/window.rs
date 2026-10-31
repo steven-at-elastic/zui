@@ -2904,13 +2904,19 @@ impl Window {
 
     /// The DirectComposition slot between the base scene and the scene
     /// overlay. Windows only, and `None` until [`Self::enable_scene_overlay`]
-    /// succeeds. The pointers are borrowed: clone them before keeping them.
+    /// succeeds. The pointers are borrowed: clone them in the paint that read them.
     ///
     /// Create child visuals with `device` and add them to `visual`. Change them
-    /// inside [`Self::on_present`] callbacks and never call `Commit`; each
-    /// presented frame presents both swap chains and then commits the device
-    /// once, so the changes land with that frame's pixels. A new `generation`
-    /// means the device and slot were recreated: rebuild the children on it.
+    /// inside [`Self::on_present`] callbacks and never call `Commit`. Each
+    /// presented frame presents both swap chains, waits up to about 16 ms for
+    /// the GPU to finish them, then commits the device once. The changes are
+    /// submitted with that frame's pixels and normally reach the screen in the
+    /// same DWM frame, but this is not guaranteed: a slower GPU, or a DWM frame
+    /// between the presents and the commit, can put them one frame apart.
+    ///
+    /// A new `generation` means GPU device loss recreated the device and slot:
+    /// rebuild the children on it. `None` after `Some` means the slot could not
+    /// be rebuilt; call [`Self::enable_scene_overlay`] again or stop using it.
     pub fn native_composition_slot(&self) -> Option<NativeCompositionSlot> {
         self.platform_window.native_composition_slot()
     }

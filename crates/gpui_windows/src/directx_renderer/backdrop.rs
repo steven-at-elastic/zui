@@ -306,8 +306,11 @@ impl DirectXRenderer {
                 0,
                 0,
                 0,
-                resources
-                    .render_target
+                // The overlay pass blurs the base frame beneath it.
+                self.overlay
+                    .as_ref()
+                    .filter(|overlay| overlay.drawing)
+                    .map_or(&resources.render_target, |overlay| &overlay.render_target)
                     .as_ref()
                     .context("missing render target")?,
                 0,
