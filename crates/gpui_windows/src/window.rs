@@ -1432,6 +1432,13 @@ unsafe extern "system" fn window_procedure(
     result
 }
 
+/// Whether `hwnd` is a GPUI window rather than one another component made inside it, such as a web view's.
+pub(crate) fn is_gpui_window(hwnd: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let length = unsafe { GetClassNameW(hwnd, &mut class) }.max(0) as usize;
+    class[..length] == *unsafe { WINDOW_CLASS_NAME.as_wide() }
+}
+
 pub(crate) fn window_from_hwnd(hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {
     if hwnd.is_invalid() {
         return None;

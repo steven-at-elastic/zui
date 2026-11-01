@@ -351,7 +351,8 @@ impl WindowsPlatform {
 }
 
 fn translate_accelerator(msg: &MSG) -> Option<()> {
-    if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
+    // Any other window answers 0 to a message it doesn't know, which would drop its keys.
+    if (msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN) || !is_gpui_window(msg.hwnd) {
         return None;
     }
 
