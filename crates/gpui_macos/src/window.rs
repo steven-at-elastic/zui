@@ -588,6 +588,9 @@ struct MacWindowState {
     overlay_backdrops: Vec<(NonNull<Object>, f32)>,
     overlay_capture_input: Arc<AtomicBool>,
     overlay_size: Option<(Size<Pixels>, f32)>,
+    overlay_was_visible: bool,
+    native_children: Vec<NativeChild>,
+    presents_with_transaction: bool,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -628,8 +631,11 @@ struct MacWindowState {
 
 impl MacWindowState {
     fn set_presents_with_transaction(&mut self, enabled: bool) {
-        // Native geometry and both Metal planes must land in the same frame.
-        let enabled = enabled || self.overlay_renderer.is_some();
+        self.presents_with_transaction = enabled;
+        self.apply_presents_with_transaction(enabled);
+    }
+
+    fn apply_presents_with_transaction(&mut self, enabled: bool) {
         self.renderer.set_presents_with_transaction(enabled);
         if let Some(renderer) = self.overlay_renderer.as_mut() {
             renderer.set_presents_with_transaction(enabled);
@@ -1007,6 +1013,9 @@ impl MacWindow {
                 overlay_backdrops: Vec::new(),
                 overlay_capture_input: Arc::new(AtomicBool::new(false)),
                 overlay_size: None,
+                overlay_was_visible: false,
+                native_children: Vec::new(),
+                presents_with_transaction: false,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -2026,6 +2035,17 @@ impl PlatformWindow for MacWindow {
                 let _: () = msg_send![parent, addSubview: view positioned: NSWindowOrderingMode::NSWindowBelow relativeTo: plane];
             }
         }
+        // Waiting for the GPU before presenting keeps native geometry and both
+        // Metal planes in one frame, but it blocks the main thread. Only frames
+        // that move native views or show the overlay need it.
+        let children = unsafe { native_children(state.native_view.as_ptr()) };
+        let synchronized = state.presents_with_transaction
+            || visible
+            || state.overlay_was_visible
+            || children != state.native_children;
+        state.native_children = children;
+        state.overlay_was_visible = visible;
+        state.apply_presents_with_transaction(synchronized);
         // Keep the Metal blur too: overlapping GPUI popovers still need to
         // blur earlier overlay content, while native effects supply the page.
         state.renderer.draw(&base);
@@ -2088,7 +2108,8 @@ impl PlatformWindow for MacWindow {
             state.overlay_view = NonNull::new(view);
             state.overlay_size = Some((size, scale));
             state.overlay_renderer = Some(renderer);
-            state.set_presents_with_transaction(true);
+            let enabled = state.presents_with_transaction;
+            state.apply_presents_with_transaction(enabled);
         }
         Ok(())
     }
@@ -2310,6 +2331,54 @@ extern "C" fn dealloc_window(this: &Object, _: Sel) {
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSWindow)), dealloc];
     }
+}
+
+/// A native child view's frame, visibility and layer mask, as last presented.
+#[derive(Clone, Copy, PartialEq)]
+struct NativeChild {
+    view: usize,
+    frame: [f64; 4],
+    hidden: bool,
+    mask: [f64; 4],
+}
+
+/// The children and grandchildren of the window's content view.
+unsafe fn native_children(parent: id) -> Vec<NativeChild> {
+    unsafe fn collect(view: id, depth: u8, out: &mut Vec<NativeChild>) {
+        unsafe {
+            let subviews: id = msg_send![view, subviews];
+            let count: NSUInteger = msg_send![subviews, count];
+            for index in 0..count {
+                let child: id = msg_send![subviews, objectAtIndex: index];
+                let frame: NSRect = msg_send![child, frame];
+                let hidden: BOOL = msg_send![child, isHidden];
+                let layer: id = msg_send![child, layer];
+                let mask: id = if layer.is_null() {
+                    nil
+                } else {
+                    msg_send![layer, mask]
+                };
+                let mask: NSRect = if mask.is_null() {
+                    NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))
+                } else {
+                    msg_send![mask, frame]
+                };
+                let rect = |r: NSRect| [r.origin.x, r.origin.y, r.size.width, r.size.height];
+                out.push(NativeChild {
+                    view: child as usize,
+                    frame: rect(frame),
+                    hidden: hidden == YES,
+                    mask: rect(mask),
+                });
+                if depth > 1 {
+                    collect(child, depth - 1, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    objc::rc::autoreleasepool(|| unsafe { collect(parent, 2, &mut out) });
+    out
 }
 
 extern "C" fn dealloc_overlay_view(this: &Object, _: Sel) {
